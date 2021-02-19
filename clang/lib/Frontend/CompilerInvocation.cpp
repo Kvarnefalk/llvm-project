@@ -1468,8 +1468,7 @@ void CompilerInvocation::GenerateCodeGenArgs(
       GenerateArg(Args, OPT_ftime_report, SA);
   }
 
-  if (Opts.FunctionSections &&
-      (Opts.BBSections == "none" || Opts.BBSections == "labels"))
+  if (Opts.FunctionSections)
     GenerateArg(Args, OPT_ffunction_sections, SA);
 
   if (Opts.PrepareForLTO && !Opts.PrepareForThinLTO)
@@ -1594,6 +1593,17 @@ void CompilerInvocation::GenerateCodeGenArgs(
 
   if (!Opts.EmitVersionIdentMetadata)
     GenerateArg(Args, OPT_Qn, SA);
+
+  switch (Opts.FiniteLoops) {
+  case CodeGenOptions::FiniteLoopsKind::Language:
+    break;
+  case CodeGenOptions::FiniteLoopsKind::Always:
+    GenerateArg(Args, OPT_ffinite_loops, SA);
+    break;
+  case CodeGenOptions::FiniteLoopsKind::Never:
+    GenerateArg(Args, OPT_fno_finite_loops, SA);
+    break;
+  }
 }
 
 bool CompilerInvocation::ParseCodeGenArgsImpl(CodeGenOptions &Opts,
@@ -1752,9 +1762,7 @@ bool CompilerInvocation::ParseCodeGenArgsImpl(CodeGenOptions &Opts,
   }
 
   // Basic Block Sections implies Function Sections.
-  Opts.FunctionSections =
-      Args.hasArg(OPT_ffunction_sections) ||
-      (Opts.BBSections != "none" && Opts.BBSections != "labels");
+  Opts.FunctionSections = Args.hasArg(OPT_ffunction_sections);
 
   Opts.PrepareForLTO = Args.hasArg(OPT_flto, OPT_flto_EQ);
   Opts.PrepareForThinLTO = false;

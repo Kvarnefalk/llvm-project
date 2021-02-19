@@ -2997,6 +2997,9 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
       return RValue::get(Builder.CreateZExt(V, ConvertType(E->getType())));
     }
 
+    if (Value *Result = getTargetHooks().testFPKind(V, BuiltinID, Builder, CGM))
+      return RValue::get(Result);
+
     // NaN has all exp bits set and a non zero significand. Therefore:
     // isnan(V) == ((exp mask - (abs(V) & exp mask)) < 0)
     unsigned bitsize = Ty->getScalarSizeInBits();
@@ -13923,15 +13926,29 @@ Value *CodeGenFunction::EmitX86BuiltinExpr(unsigned BuiltinID,
   case X86::BI__builtin_ia32_reduce_fadd_ps512: {
     Function *F =
         CGM.getIntrinsic(Intrinsic::vector_reduce_fadd, Ops[1]->getType());
-    Builder.getFastMathFlags().setAllowReassoc(true);
+    Builder.getFastMathFlags().setAllowReassoc();
     return Builder.CreateCall(F, {Ops[0], Ops[1]});
   }
   case X86::BI__builtin_ia32_reduce_fmul_pd512:
   case X86::BI__builtin_ia32_reduce_fmul_ps512: {
     Function *F =
         CGM.getIntrinsic(Intrinsic::vector_reduce_fmul, Ops[1]->getType());
-    Builder.getFastMathFlags().setAllowReassoc(true);
+    Builder.getFastMathFlags().setAllowReassoc();
     return Builder.CreateCall(F, {Ops[0], Ops[1]});
+  }
+  case X86::BI__builtin_ia32_reduce_fmax_pd512:
+  case X86::BI__builtin_ia32_reduce_fmax_ps512: {
+    Function *F =
+        CGM.getIntrinsic(Intrinsic::vector_reduce_fmax, Ops[0]->getType());
+    Builder.getFastMathFlags().setNoNaNs();
+    return Builder.CreateCall(F, {Ops[0]});
+  }
+  case X86::BI__builtin_ia32_reduce_fmin_pd512:
+  case X86::BI__builtin_ia32_reduce_fmin_ps512: {
+    Function *F =
+        CGM.getIntrinsic(Intrinsic::vector_reduce_fmin, Ops[0]->getType());
+    Builder.getFastMathFlags().setNoNaNs();
+    return Builder.CreateCall(F, {Ops[0]});
   }
   case X86::BI__builtin_ia32_reduce_mul_d512:
   case X86::BI__builtin_ia32_reduce_mul_q512: {
