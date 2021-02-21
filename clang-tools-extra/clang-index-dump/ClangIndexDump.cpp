@@ -1,32 +1,43 @@
 #include <iostream>
 #include <list>
 #include <sqlite3.h>
+#include <filesystem>
+#include <stdio.h>
+#include <dirent.h>
+#include <unordered_set>
 #include "clang/Index/IndexRecordWriter.h"
 #include "clang/Index/IndexRecordReader.h"
 #include "clang/Index/IndexUnitReader.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/CommandLine.h"
+
 
 using namespace clang;
+namespace fs = std::__fs::filesystem;
 
-const std::string CREATE_SYMBOL_TABLE_STMNT = "create table symbol(id INTEGER primary key, usr varchar(50), name TEXT, kind TEXT, subkind TEXT, language TEXT)";
-const std::string CREATE_OCCURRENCE_TABLE_STMNT = "create table occurrence(id INTEGER, symbol_id INTEGER, role TEXT, path TEXT, is_system BOOLEAN, line INTEGER, column INTEGER)";
-const std::string CREATE_RELATION_TABLE_STMNT = "create table relation(occurrence_id INTEGER, symbol_id INTEGER, role TEXT)";
 
-const std::string INSERT_SYMBOL_STMNT = "INSERT INTO symbol (id, usr, name, kind, subkind, language) VALUES (";
-const std::string INSERT_OCCURRENCE_STMNT = "INSERT INTO occurrence (id, symbol_id, role, path, is_system, line, column) VALUES (";
-const std::string INSERT_RELATION_STMNT = "INSERT INTO relation (occurrence_id, symbol_id, role) VALUES (";
+const std::string CREATE_SYMBOL_TABLE_STMNT = "create table symbol(usr varchar(50) PRIMARY KEY, name TEXT, kind TEXT, subkind TEXT, language TEXT)";
+const std::string CREATE_OCCURRENCE_TABLE_STMNT = "create table occurrence(id INTEGER, symbol_usr TEXT, role TEXT, path TEXT, is_system BOOLEAN, line INTEGER, column INTEGER)";
+const std::string CREATE_RELATION_TABLE_STMNT = "create table relation(occurrence_id INTEGER, symbol_usr TEXT, role TEXT)";
+
+const std::string INSERT_SYMBOL_STMNT = "INSERT INTO symbol (usr, name, kind, subkind, language) VALUES (";
+const std::string INSERT_OCCURRENCE_STMNT = "INSERT INTO occurrence (id, symbol_usr, role, path, is_system, line, column) VALUES (";
+const std::string INSERT_RELATION_STMNT = "INSERT INTO relation (occurrence_id, symbol_usr, role) VALUES (";
 
 class RecordSqliteDumper {
 public:
 
-    RecordSqliteDumper(const char *sqliteDBPath, StringRef dStorePath) {
+    RecordSqliteDumper(const char *sqliteDBPath, StringRef dStorePath, StringRef pPath) {
+        remove(sqliteDBPath);
         sqlite3_open(sqliteDBPath, &DB);
         char *errorMessage = 0;
         sqlite3_exec(DB, CREATE_SYMBOL_TABLE_STMNT.c_str(), NULL, 0, &errorMessage);
         sqlite3_exec(DB, CREATE_OCCURRENCE_TABLE_STMNT.c_str(), NULL, 0, &errorMessage);
         sqlite3_exec(DB, CREATE_RELATION_TABLE_STMNT.c_str(), NULL, 0, &errorMessage);
         dataStorePath = dStorePath;
+        projectPath = pPath;
         occurrenceIdCounter = 0;
+        recordCounter = 0;
     }
     
     ~RecordSqliteDumper() {
@@ -34,45 +45,77 @@ public:
     }
     
     int dumpToDatabase() {
-        std::string error("");
-        
-        for (auto unitName: unitNames) {
-            //auto indexReader = index::IndexUnitReader::createWithUnitFilename(StringRef("regexec.o-IYZYYYBU8KQO"), dataStorePath, error);
-            auto indexReader = index::IndexUnitReader::createWithUnitFilename(StringRef(unitName), dataStorePath, error);
-            auto depFn = [&](const index::IndexUnitReader::DependencyInfo &RO) -> bool {
-                return dependencyInfoHandler(RO);
-            };
-            indexReader->foreachDependency(depFn);
-        }
+        recordCounter = 0;
+        std::string unitIndexPath = dataStorePath.str() + "v5/units/";
+
+        struct dirent *entry = nullptr;
+            DIR *dp = nullptr;
+
+            dp = opendir(unitIndexPath.c_str());
+            if (dp != nullptr) {
+                while ((entry = readdir(dp)))
+                    if (entry->d_namlen > 5) {
+                        dumpUnitFile(entry->d_name);
+                    }
+            }
+
+        closedir(dp);
         return 0;
     }
     
 private:
     sqlite3* DB;
     StringRef dataStorePath;
+    StringRef projectPath;
     u_int64_t occurrenceIdCounter;
+    std::unordered_set<std::string> visitedRecords;\
+    u_int64_t recordCounter;
+
+    void dumpUnitFile(const char* recordName) {
+
+        sqlite3_exec(DB, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+
+        std::string error("");
+        std::cout << "Dumping: " << std::to_string(recordCounter++) << ", " << recordName << std::endl;
+        auto indexReader = index::IndexUnitReader::createWithUnitFilename(StringRef(recordName), dataStorePath, error);
+        auto depFn = [&](const index::IndexUnitReader::DependencyInfo &RO) -> bool {
+            return dependencyInfoHandler(RO);
+        };
+        indexReader->foreachDependency(depFn);
+        sqlite3_exec(DB, "END TRANSACTION;", NULL, NULL, NULL);
+    }
     
+    bool shouldVisitDependencyInfo(const index::IndexUnitReader::DependencyInfo &dependencyInfo) {
+        return dependencyInfo.FilePath.startswith_lower(projectPath) && !visitedRecords.count(dependencyInfo.UnitOrRecordName.str()) && dependencyInfo.Kind == index::IndexUnitReader::DependencyKind::Record;
+    }
+
     bool dependencyInfoHandler(const index::IndexUnitReader::DependencyInfo dependencyInfo) {
-        if (dependencyInfo.Kind != index::IndexUnitReader::DependencyKind::Record) return true;
-        
+        if (!shouldVisitDependencyInfo(dependencyInfo)) {
+            return true;
+        }
+
         std::string error("");
         auto recordReader = clang::index::IndexRecordReader::createWithRecordFilename(dependencyInfo.UnitOrRecordName, dataStorePath, error);
         
         auto declFn = [&](const clang::index::IndexRecordDecl *D) -> bool {
             return declHandler(D);
         };
+
         auto occurFn = [&](const index::IndexRecordOccurrence &RO) -> bool {
             return occurenceHandler(RO, dependencyInfo.FilePath, dependencyInfo.IsSystem);
         };
         recordReader->foreachDecl(true, declFn);
         recordReader->foreachOccurrence(occurFn);
+
+        visitedRecords.insert(dependencyInfo.UnitOrRecordName.str());
+
         return true;
     }
     
     bool declHandler(const clang::index::IndexRecordDecl *decl) {
         auto declaration = (*decl);
         std::string query = (INSERT_SYMBOL_STMNT
-                             + std::to_string(declaration.DeclID) + ", \""
+                             + "\""
                              + declaration.USR.str() + "\", \""
                              + declaration.Name.str() + "\", \""
                              + getKindName(declaration.SymInfo.Kind) + "\", \""
@@ -84,27 +127,36 @@ private:
     }
     
     bool occurenceHandler(const clang::index::IndexRecordOccurrence &occurrence, StringRef filePath, bool isSystem) {
+        auto relativeFilePath = filePath.str().substr(projectPath.str().length() + 1);
         for (auto role: getRoleNames(occurrence.Roles)) {
             std::string query = (INSERT_OCCURRENCE_STMNT
-                                 + std::to_string(occurrenceIdCounter) + ", "
-                                 + std::to_string(occurrence.Dcl->DeclID) + ", \""
+                                 + std::to_string(occurrenceIdCounter) + ", \""
+                                 + occurrence.Dcl->USR.str() + "\", \""
                                  + role + "\", \""
-                                 + filePath.str() + "\", "
+                                 + relativeFilePath + "\", "
                                  + std::to_string(isSystem) + ", "
                                  + std::to_string(occurrence.Line) + ", "
                                  + std::to_string(occurrence.Column) + ")");
             char* messaggeError;
+
             sqlite3_exec(DB, query.c_str(), NULL, 0, &messaggeError);
+            if (messaggeError != NULL) {
+                std::cout << "OCCURRENCE ERROR: " << messaggeError << std::endl;
+            }
         }
 
         for (auto &rel: occurrence.Relations) {
             for (auto role: getRoleNames(rel.Roles)) {
                 std::string query = (INSERT_RELATION_STMNT
-                                     + std::to_string(occurrenceIdCounter) + ", "
-                                     + std::to_string(rel.Dcl->DeclID) + ", \""
+                                     + std::to_string(occurrenceIdCounter) + ", \""
+                                     + rel.Dcl->USR.str() + "\", \""
                                      + role + "\")");
                 char* messaggeError;
                 sqlite3_exec(DB, query.c_str(), NULL, 0, &messaggeError);
+                if (messaggeError != NULL) {
+                    std::cout << "RELATION ERROR: " << messaggeError << std::endl;
+                }
+
             }
         }
         
@@ -313,21 +365,15 @@ private:
         }
         return roleNames;
     }
-
-    void print(std::list<std::string> const &list) {
-        for (auto const& i: list) {
-            std::cout << "\t\t\t" << i << "\n";
-        }
-    }
-
 };
 
+llvm::cl::opt<std::string> OutputDBPath("output-db", llvm::cl::desc("Path of the output sqlite db"), llvm::cl::value_desc("filename"), llvm::cl::Required);
+llvm::cl::opt<std::string> IndexDataStorePath("index-datastore-path", llvm::cl::desc("Path of the index datastore"), llvm::cl::value_desc("filename"), llvm::cl::Required);
+llvm::cl::opt<std::string> ProjectPath("project-path", llvm::cl::desc("Path to the root dir of the project containing the source code"), llvm::cl::value_desc("filename"), llvm::cl::Required);
 
-int main() {
-    RecordSqliteDumper dumper("/Users/john/cpp.sqlite3", "/Users/john/Library/Developer/Xcode/DerivedData/LLVM-dyvuytlyfmtmcegqamkaftqcwljl/Index/DataStore");
+int main(int argc, char **argv) {
+    llvm::cl::ParseCommandLineOptions(argc, argv);
+    RecordSqliteDumper dumper(OutputDBPath.c_str(), IndexDataStorePath.c_str(), ProjectPath.c_str());
     dumper.dumpToDatabase();
-    std::cout << "DUMPING" << std::endl;
-
-
     return 0;
 }
